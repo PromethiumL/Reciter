@@ -1,0 +1,576 @@
+#!/bin/zsh
+
+# CREATE TABLE IF NOT EXISTS "dict"(word varchar(30), exp varchars(100), freq number(5), id int(6));
+# CREATE TABLE progress (date date, total number(4), ascid number(5));
+# CREATE TABLE errorlist(id number(5),word varchar(30),date date);
+
+help_doc='Usage: recite [-d database] [options]
+
+options:
+    -a, --add                   add item mode
+    -d, --database dbname       specify database by name without ".db"
+    -r, --remove                remove item mode
+        [-e]                    remove errorlist item mode
+    -h, --help                  print this help document
+    -s, --search keyword        search the keyword in db
+    -R, --review                review mode
+    -A, --asc                   learn items in ascending ID order
+    -l, --list                  list items
+        [-a | --all]                list all items in the "dict" table, default option
+        [-e | --error]              list all items in the "errorList" table
+                                use a new name to create database.
+    -0, --reset-item                reset the frequency of the item to 0
+    -3, --relearn-item              add 3 to an item
+    -p, --prompt rate           specify the rate of prompt, ranging from 0 to 10, integer'
+
+SOURCE=$(readlink -f $0)
+work_dir=$(dirname $SOURCE)/recite_work_dir
+logfile=$work_dir/log.txt
+db=$work_dir/default.db
+promptList="ABCDEFGHIJKLMNOPQRSTUVWXYZ \'"
+sql=`which sqlite3`
+
+Red() {
+	echo -e -n "\033[31m"
+}
+Green() {
+	echo -e -n "\033[32m"
+}
+Yellow() {
+	echo -e -n "\033[33m"
+}
+Blue() {
+	echo -e -n "\033[34m"
+}
+Purple() {
+	echo -e -n "\033[35m"
+}
+Cyan() {
+	echo -e -n "\033[36m"
+}
+
+White() {
+	echo -e -n "\033[0m"
+}
+
+singleQuote="'"
+escapedQuote="''"
+
+EscapeQuote() {
+	str=${1//$singleQuote/$escapedQuote}
+	echo $str
+}
+
+InitDatabase() {	
+	if ! [ -e $db ]; then 
+		PS3="Database file '$db' not found. Create it?"
+		select choice in 'Create it' 'Exit'; do
+			break
+		done
+		if [[ "$choice" == "Create it" ]]; then
+			touch "$db"
+			$sql $db 'CREATE TABLE IF NOT EXISTS "dict"(word varchar(30), exp varchars(100), freq number(5), time date);'
+			$sql $db 'CREATE TABLE progress (date date, total number(4), ascid number(5));'
+			$sql $db 'CREATE TABLE errorlist(id number(5),word varchar(30),date date);'
+		else
+			exit 1
+		fi
+	else
+		# Green
+		# PS3="Would you like to create a newer version of the database's backup file?"
+		# select choice in 'no' 'yes'; do break; done
+		# if [[ $choice == 'yes' ]]; then
+			cp $db $db.bak
+		# fi
+		# White
+	fi
+}
+
+InitDict() {
+	itemNumber=`$sql $db 'select count(*) from dict;'`
+	echo "found $itemNumber items."
+}
+
+
+promptRate=0
+# promptRate ranges between 0..10
+
+prompt() {
+# usage: prompt $word
+# returns blank with random number of hint letters.
+	str=$1
+	pstr=''
+	temp=${str#?}
+	ch=${str%"$temp"}
+	pstr="$ch"
+	str=$temp
+	while [ -n "$str" ]; do
+		temp=${str#?}
+		ch=${str%"$temp"}
+		if [[ "$promptList" =~ "$ch" ]]; then
+			pstr="$pstr""$ch"
+		else
+			x=$((RANDOM%10))
+			if [[ $x < $promptRate ]]; then
+				pstr="$pstr$ch"
+			else
+				pstr="$pstr""_"
+			fi
+		fi
+		str=$temp
+	done
+}
+
+LearnItem() {
+# usage: LearnItem $id $mode
+#  mode: mode is a string printed on screen.
+	clear
+	id=$1
+	mode=$2
+	word=`$sql $db "select word from dict where rowid=$id;"`
+	expl=`$sql $db "select exp from dict where rowid=$id;"`
+	freq=`$sql $db "select freq from dict where rowid=$id;"`
+	prompt $word
+	
+	GetProgress
+	echo "mode: $mode | today learned: $counter"
+	echo "id: $1 | freq: $freq | length: ${#word}"
+	echo
+	echo "$expl "
+	echo
+	echo "      > $pstr"
+	echo
+	echo -n 'answer> '
+	Blue; read ans; White
+
+	if [[ "${ans}" == "${word}" ]]; then
+		echo "OK."
+		ret=0
+	else
+		echo "WRONG."
+		echo "answer:\"$word\""
+		ret=1
+	fi
+
+	if [[ "$ret" == 0 ]]; then
+		let freq--
+		$sql $db "update dict set freq = $freq where oid = $id;"
+		if [[ "$freq" == 0 ]]; then
+			$sql $db "insert into errorlist values($id, '$word', '$today');"
+		fi
+		sleep 1
+	else
+		echo "Not a typo?"
+		echo "[Enter] to confirm"
+		Blue; read choice; White
+		if [ -z "$choice" ]; then
+			x=''
+			rightAnswer=`echo $word | tr /A-Z/ /a-z/`
+			while [[ "`echo $x | tr /A-Z/ /a-z/`" != "$rightAnswer" ]]; do
+				echo "Now repeat the correct answer:"
+				echo -n "repeat> "
+				Blue; read x; White
+			done
+			echo "OK."
+			$sql $db "update dict set freq=$((freq+3)) where rowid = $id;"
+		else
+			echo "All right."
+			sleep 1
+		fi
+	fi
+}
+
+RemoveItem() {
+	if [ -z $1 ]; then
+		table='dict'
+	else
+		table='errorlist'
+	fi
+	SelectItem RemoveOpt
+}
+
+RemoveOpt() {
+	$sql -column -header $db "select oid, * from ${table:-dict} where oid=$id;"
+	Red
+	PS3="Remove it? (id: $id)"
+	select choice in yes no; do
+		break
+	done
+	White
+	if [[ "$choice" == 'yes' ]]; then
+		$sql $db "delete from ${table:-dict} where oid = $str;"
+		echo "Removed."
+		echo 
+	else
+		break
+	fi
+}
+
+AddFrequencyOpt() {
+	$sql -column -header $db "select oid, * from dict where oid=$id;"
+	Green
+	PS3="Add 3 to freq ? (id: $id)"
+	select choice in yes no; do
+		break
+	done
+	White
+	if [[ "$choice" == 'no' ]] || [[ "$choice" == '2' ]] ; then
+		:
+	else
+		local freq
+		freq=`$sql $db "select freq from dict where oid = $id;"`
+		$sql $db "update dict set freq=$((freq+3)) where oid = $id;"
+		echo "Updated."
+		echo 
+	fi
+}
+
+ResetFrequencyOpt() {
+	$sql -column -header $db "select oid, * from dict where oid=$id;"
+	Green
+	PS3="Add 3 to freq ? (id: $id)"
+	select choice in yes no; do
+		break
+	done
+	White
+	if [[ "$choice" == 'yes' ]]; then
+		$sql $db "update dict set freq=0 where oid = $id;"
+		echo "Updated."
+		echo 
+	else
+		break
+	fi
+}
+
+SelectItem() { # select item by id
+	Green
+	echo "
+Input the id of item to manipulate, 
+or start a query beginning with 
+	'/' (pattern search),
+	'=' (accurate search),
+	'^' (match from the beginning)."
+	White
+	while :; do
+		echo -n ' >'
+		Blue; read str; White
+		ch=${str:0:1}
+		if [[ "$str" =~ "^\s*$" ]]; then
+			if [[ $selected == 1 ]]; then
+				$1
+				selected=0
+			else
+				continue
+			fi
+		elif [[ "$ch" == '/' ]] || [[ "$ch" == '=' ]] || [[ "$ch" == '^' ]]; then
+			str=${str:1}
+			case "$ch" in
+			'/')
+				sqlstr="from ${table:-dict} where word like '%$(EscapeQuote $str)%';"
+				;;
+			'^')
+				sqlstr="from ${table:-dict} where word like '$(EscapeQuote $str)%';"
+				;;
+			'=')
+				sqlstr="from ${table:-dict} where word like '$(EscapeQuote $str)';"
+				;;
+			esac
+			cnt=`$sql $db "select count(*) $sqlstr ;"`
+			if [[ $cnt == 0 ]]; then
+				echo "(empty)"
+				echo
+				continue
+			elif [[ $cnt -ge 1 ]]; then
+				$sql -column -header $db "select oid, * $sqlstr;"
+				id=`$sql $db "select oid $sqlstr ;"`
+				for i in `echo $id`; do id=$i; break; done
+				echo "(id $id selected, empty to confirm)"
+				selected=1
+			fi
+		elif [[ "${str:0:1}" == 'q' ]]; then
+			break
+		elif [[ "$str" =~ '^[1-9][0-9]*$' ]]; then
+			id=$str
+			cnt=`$sql $db "select count(*) from dict where rowid = $id"`
+			if [[ $cnt -gt 0 ]]; then
+				$1
+			else
+				echo "No such item : id = $id"
+			fi
+		fi
+	done
+}
+
+Recite() {
+	mode=$2
+	Learn
+}
+
+ReviewErrorList() {
+	for id in $($sql $db "select rowid from dict where freq > 0 order by freq DESC"); do
+		LearnItem $id "review"
+	done
+}
+
+SearchItem() {
+	while [[ "$keyword" == '' ]]; do
+		echo -n 'Keyword like:'
+		Blue; read keyword; White
+	done
+	EscapeQuote $keyword
+	ch=${keyword:1}
+	case "$ch" in
+	'^')
+		sqlstr="from ${table:-dict} where word like '$(EscapeQuote $str)%' or exp like '%$(EscapeQuote $str)%';"
+		;;
+	'=')
+		sqlstr="from ${table:-dict} where word like '$(EscapeQuote $str)' or exp like '%$(EscapeQuote $str)%';"
+		;;
+	*)
+		sqlstr="from ${table:-dict} where word like '%$(EscapeQuote $str)%' or exp like '%$(EscapeQuote $str)%';"
+		;;
+	esac
+	$sql -column -header $db "select * $sqlstr" | less
+}
+
+HandleTerm() {
+	PS3="Skip or next?"
+	select opt in skip next; do
+		break
+	done
+	if [[ "$opt" == "skip" ]];then
+		return
+	else
+		exit
+	fi
+}
+
+
+Learn() {
+	while true; do
+		ReviewErrorList
+		max=`$sql $db "select max(rowid) from dict;"`
+		for i in `seq 15`; do 
+			id=$((RANDOM%max+1))
+			cnt=`$sql $db "select count(*) from dict where oid=$id"`
+			if [[ $cnt -gt 0 ]]; then
+				LearnItem $id "learn"
+			fi
+			AddProgress
+		done
+	done
+}
+
+
+Learn_asc() {
+	# try to get the ascid
+	ascid=`$sql $db "select ascid from progress where date<='$today' and ascid > 0 order by date desc;" | sed -n '1 p'`
+	if [[ "$1" == "" ]]; then	
+		if [[ "$ascid" != "" ]]; then 
+			PS3="Start from id = $ascid ()?"
+		select opt in "Yes" "Start from id = 1"; do
+			break
+		done
+	
+		fi	
+	
+		case $opt in
+		"Yes")
+			startid=$ascid
+			;;
+		*)
+			startid=1
+		esac
+	else
+		startid=$1
+	fi
+
+	while true; do
+		local j=0
+		for i in `$sql $db "select rowid from dict order by word" | sed -n "$startid,$((itemNumber-$startid)) p;"`; do 
+			Recite $i "learn_asc"
+			AddProgress
+			j=$((j+1))
+			$sql $db "update progress set ascid=$((startid+j)) where date = '$today';"
+			if [[ $((j%10)) == 0 ]]; then
+				ascid=`$sql $db "select ascid from progress where date='$today';"`
+				startid=$ascid
+				break
+			fi
+		done
+		reviewErrorList 
+	done
+}
+
+GetProgress() {
+	today=`date -I`
+	counter=`$sql $db "select total from progress where date='$today'"`
+	if [[ "$counter" == "" ]]; then
+		$sql $db "insert into progress values ('$today',0, 0);"
+		counter=0
+	fi
+}
+
+AddItem() {
+	local confirm
+
+	clear
+	echo "mode: add items | total in dict: $itemNumber\n"
+	GetProgress
+	confirm=0
+	while [[ $confirm == 0 ]]; do
+		echo -n "Keyword:\n >"
+		Blue; read keyword; White
+		echo "[Enter] to confirm, or input something else to edit it again:"
+		Blue; read choice; White
+		if [[ $choice == '' ]]; then
+			confirm=1
+		fi
+	done
+
+	confirm=0
+	while [[ $confirm == 0 ]]; do
+		echo -n "Explanation(hint):\n >"
+		Blue; read explanation; White
+		echo "[Enter] to confirm, or input something else to edit it again:"
+		Blue; read choice; White
+		if [[ $choice == '' ]]; then
+			confirm=1
+		fi
+	done
+	echo "You created an item in the dict in \"$db\":"
+	echo "\"$keyword\" : \"$explanation\", freq : 0, date : $today"
+	$sql $db "insert into dict values ('`EscapeQuote $keyword`', '`EscapeQuote $explanation`', 0, '$today');"
+	let itemNumber++
+}
+
+RelearnItem() {
+	SelectItem AddFrequencyOpt
+}
+
+ResetItem() {
+	SelectItem ResetFrequencyOpt
+}
+
+ListItems() {
+	if [ -n "$1" ]; then
+		table='errorlist'
+		$sql -column -header $db "select oid, * from ${table:-dict};" | less
+	else
+		$sql -column -header $db "select oid, * from ${table:-dict} order by freq DESC;" | less
+	fi
+}
+
+AddProgress() {
+	counter=$((counter+1))
+	$sql $db "update progress set total = $counter where date='$today' ;"
+	GetProgress
+}
+
+GetParams() {
+	while [[ "$1" != "" ]]; do
+		case "$1" in
+		'--asc'|'-A')
+			_mode="asc"
+			shift
+			ascid=$1
+			# should check if it is actually a number.
+			;;
+		'-d'|'--database')
+			shift
+			db=$work_dir/$1.db
+			echo "db specified: $db"
+			InitDatabase
+			;;
+		'--add'|'-a')
+			_mode="add"
+			;;
+		'--prompt'|'-p')
+			[[ "$2" -ge 0 ]] || [[ "$2" -le 100 ]] && { promptRate=$2; shift; };
+			;;
+		'--remove'|'-r')
+			_mode="remove"
+			;;
+		'--search'|'-s')
+			_mode="search"
+			;;
+		'--review'|'-R')
+			_mode="review"
+			;;
+		'--list'|'-l')
+			if [[ "$2" == '-e' ]] || [[ "$2" == '--error' ]]; then
+				ListItems -e
+				shift
+			elif [[ "$2" == '-a' ]] || [[ "$2" == '--all' ]]; then
+				shift
+				ListItems
+			elif [[ -n "$2" ]]; then
+				echo $help_doc
+				exit 1
+			else
+				ListItems
+			fi
+			exit
+			;;
+		'--help'|'-h')
+			echo $help_doc
+			exit
+			;;
+		'--reset-item'|'-0')
+			ResetItem
+			exit
+			;;
+		'--relearn-item'|'-3')
+			RelearnItem
+			exit
+			;;
+		*)
+			echo "recite: unrecognized option: '$1'\nTry 'recite -h' for more infomation."
+			exit
+		esac
+	shift
+	done
+}
+
+main() {
+	case "$_mode" in
+	'asc')
+		Learn_asc $ascid
+		;;
+	'add')
+		loop=1
+		while [[ $loop ]]; do
+			AddItem
+			echo "\nContinue to add an new item?"
+			echo "[Enter] to confirm, or input something else to exit:"
+			Blue; read choice; White
+			if [[ $choice != '' ]]; then
+				break
+			fi
+		done
+		;;
+	'review')
+		ReviewErrorList
+		Blue
+		echo 'Done.'
+		White
+		;;
+	'remove')
+		RemoveItem
+		;;
+	'search')
+		SearchItem
+		;;
+	*)
+		Learn
+	esac
+}
+
+trap "echo ; Red; echo Interrupted. ; White; exit 0" 15 SIGINT
+
+GetParams "$@"
+
+InitDict
+
+
+main
