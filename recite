@@ -20,7 +20,7 @@ options:
         [-e | --error]              list all items in the "errorList" table
                                 use a new name to create database.
     -0, --reset-item                reset the frequency of the item to 0
-    -3, --relearn-item              add 3 to an item
+    -i, --relearn-item              add 3 to an item
     -p, --prompt rate           specify the rate of prompt, ranging from 0 to 10, integer'
 
 SOURCE=$(readlink -f $0)
@@ -29,6 +29,12 @@ logfile=$work_dir/log.txt
 db=$work_dir/default.db
 promptList="ABCDEFGHIJKLMNOPQRSTUVWXYZ \'"
 sql=`which sqlite3`
+
+system=`uname -s`
+
+#if [[ "${system:0:5}" == 'MINGW' ]]; then
+#	sql=./sqlite3.exe
+#fi
 
 Red() {
 	echo -e -n "\033[31m"
@@ -198,7 +204,7 @@ RemoveOpt() {
 	done
 	White
 	if [[ "$choice" == 'yes' ]]; then
-		$sql $db "delete from ${table:-dict} where oid = $str;"
+		$sql $db "delete from ${table:-dict} where oid = $id;"
 		echo "Removed."
 		echo 
 	else
@@ -249,7 +255,8 @@ Input the id of item to manipulate,
 or start a query beginning with 
 	'/' (pattern search),
 	'=' (accurate search),
-	'^' (match from the beginning)."
+	'^' (match from the beginning).
+	'$' (match near the end)."
 	White
 	while :; do
 		echo -n ' >'
@@ -262,7 +269,7 @@ or start a query beginning with
 			else
 				continue
 			fi
-		elif [[ "$ch" == '/' ]] || [[ "$ch" == '=' ]] || [[ "$ch" == '^' ]]; then
+		elif [[ "$ch" == '/' ]] || [[ "$ch" == '$' ]] || [[ "$ch" == '=' ]] || [[ "$ch" == '^' ]]; then
 			str=${str:1}
 			case "$ch" in
 			'/')
@@ -270,6 +277,9 @@ or start a query beginning with
 				;;
 			'^')
 				sqlstr="from ${table:-dict} where word like '$(EscapeQuote $str)%';"
+				;;
+			'$')
+				sqlstr="from ${table:-dict} where word like '%$(EscapeQuote $str)';"
 				;;
 			'=')
 				sqlstr="from ${table:-dict} where word like '$(EscapeQuote $str)';"
@@ -297,6 +307,8 @@ or start a query beginning with
 			else
 				echo "No such item : id = $id"
 			fi
+		elif [[ "$selected" == 1 ]]; then
+			selected=0
 		fi
 	done
 }
@@ -307,8 +319,13 @@ Recite() {
 }
 
 ReviewErrorList() {
-	for id in $($sql $db "select rowid from dict where freq > 0 order by freq DESC"); do
+	errorids=`$sql $db "select rowid from dict where freq > 0 order by freq DESC"`
+	local count
+	count=0
+	for id in `echo $errorids`; do
 		LearnItem $id "review"
+		((count++))
+		AddProgress
 	done
 }
 
@@ -325,6 +342,9 @@ SearchItem() {
 		;;
 	'=')
 		sqlstr="from ${table:-dict} where word like '$(EscapeQuote $str)' or exp like '%$(EscapeQuote $str)%';"
+		;;
+	'$')
+		sqlstr="from ${table:-dict} where word like '$(EscapeQuote $str)' or exp like '%$(EscapeQuote $str)';"
 		;;
 	*)
 		sqlstr="from ${table:-dict} where word like '%$(EscapeQuote $str)%' or exp like '%$(EscapeQuote $str)%';"
@@ -520,7 +540,7 @@ GetParams() {
 			ResetItem
 			exit
 			;;
-		'--relearn-item'|'-3')
+		'--relearn-item'|'-i')
 			RelearnItem
 			exit
 			;;
